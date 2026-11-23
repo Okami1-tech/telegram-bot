@@ -71,7 +71,8 @@ Emitted by the poller loop during event ingestion, cursor management, cycle exec
 
 | Field | Type | Description |
 |---|---|---|
-| `action` | `string` | `"start"`, `"paused"`, `"resumed"`, `"resume"`, `"cursor_quarantined"`, `"cursor_quarantine_failed"`, `"cursor_persist_failed"`, `"event_skipped"`, `"format_failed"`, `"notification_cap_reached"`, `"persistent_volume_unwritable"`. |
+| `action` | `string` | `"start"`, `"paused"`, `"resumed"`, `"resume"`, `"cursor_quarantined"`, `"cursor_quarantine_failed"`, `"cursor_permission_denied"`, `"cursor_read_failed"`, `"cursor_persist_failed"`, `"event_skipped"`, `"format_failed"`, `"notification_cap_reached"`, `"persistent_volume_unwritable"`. |
+| `diagnosticCode` | `string` | Stable cursor diagnostic code (`"CURSOR_NOT_FOUND"`, `"CURSOR_PERMISSION_DENIED"`, `"CURSOR_IO_ERROR"`, `"CURSOR_CORRUPT_JSON"`). |
 | `marketContractId` | `string` | Mimir market contract address watched. |
 | `squadContractId` | `string` | Mimir squad contract address watched. |
 | `pollIntervalMs` | `number` | Polling interval in milliseconds. |
@@ -129,6 +130,12 @@ Every log record is redacted before it leaves the process via the shared redacti
 
 ### Redaction Policy Self-Check (`npm run doctor`)
 `npm run doctor` runs a `redaction-policy` self-check that passes synthetic secret probes (registered secret, Telegram bot token, Stellar seed strkey, URL userinfo/query credentials, Bearer token, and env key-value secret) through all configured log formats (`text`, `json`). If any probe leaks, the check fails and reports only the leaked field names—never the probe values or raw log lines.
+
+### Callback Error Logging
+Callback query handlers (`src/callbacks.ts`, `src/commands/broadcast.ts`, `src/commands/runtime.ts`, and `bot.catch` in `src/bot.ts`) never serialize full Telegram updates or arbitrary thrown objects:
+- **Stable IDs only**: Logs include only bounded correlation IDs (`update_id`, `callback_query_id`, `action`, and `broadcast_id` when applicable).
+- **Redacted error categories**: Errors are mapped to bounded categories (for example `timeout`, `telegram_api_400:editMessageText`, `telegram_query_expired`, `code:ECONNREFUSED`, `unstructured_update_error`, `runtime_error`) rather than dumping `JSON.stringify(err)` or raw update payloads.
+- **Hostile update bounds**: Deeply nested, circular, or throwing-getter update payloads are never traversed; formatted callback error lines are redacted and hard-capped at 240 characters (`MAX_CALLBACK_ERROR_LOG_LEN`).
 
 ---
 

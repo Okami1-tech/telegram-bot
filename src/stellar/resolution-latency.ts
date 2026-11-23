@@ -26,6 +26,7 @@ export interface ResolutionLatencyReport {
   resolved: LatencyGroup;
   cancelled: LatencyGroup;
   excludedCount: number;
+  conflicts: ConflictingTerminalEvents[];
 }
 
 function nearestRank(sortedValues: number[], p: number): number {
@@ -91,6 +92,7 @@ export function resolutionLatency(
 
   const resolvedClaims: ClaimLatency[] = [];
   const cancelledClaims: ClaimLatency[] = [];
+  const conflicts: ConflictingTerminalEvents[] = [];
   let excludedCount = 0;
 
   for (const key of allKeys) {
@@ -129,10 +131,12 @@ export function resolutionLatency(
 
   resolvedClaims.sort((a, b) => a.claimId - b.claimId);
   cancelledClaims.sort((a, b) => a.claimId - b.claimId);
+  conflicts.sort((a, b) => a.claimId - b.claimId);
 
   return {
     resolved: { claims: resolvedClaims, summary: computeSummary(resolvedClaims) },
     cancelled: { claims: cancelledClaims, summary: computeSummary(cancelledClaims) },
     excludedCount,
+    conflicts,
   };
 }

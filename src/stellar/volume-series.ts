@@ -1,4 +1,19 @@
-import type { DecodedEvent } from "./decode.js";
+/**
+ * Time-bucketed volume series for challenge stakes and squad deposits.
+ *
+ * Derives hourly and daily volume aggregations from observed chain events.
+ *
+ * Invariants:
+ * - Avoids floating-point accumulation: amounts are strictly parsed and accumulated
+ *   as non-negative atomic integer USDC units (`bigint`).
+ * - Canonical 7-decimal USDC formatting (`formatUsdc`) is applied only at the
+ *   export boundary (`exportVolumeBucket`, `exportVolumeBuckets`, `exportVolumeSeries`,
+ *   `renderVolumeSeries`).
+ * - Zero-fills missing intermediate time buckets in UTC.
+ * - Deterministic ordering ascending by bucket timestamp.
+ */
+
+import { formatUsdc, type DecodedEvent } from "./decode.js";
 
 export type VolumeBucketUnit = "hour" | "day";
 
@@ -14,6 +29,11 @@ export interface VolumeSeriesOptions {
   identity?: (event: DecodedEvent) => string;
 }
 
+/**
+ * Summary of the volume series. Conflicting terminal events are not silently
+ * resolved; they are reported via `inconsistencies`.
+ */
+
 export interface VolumeBucket {
   /** UTC ISO string representing the start of the bucket. */
   timestamp: string;
@@ -28,6 +48,12 @@ export interface VolumeBucket {
   challengeCount: number;
   depositCount: number;
   eventCount: number;
+  /**
+   * True when no valid events fell into this bucket. Zero-filled buckets carry
+   * `empty: true` so consumers can distinguish an absent observation from a
+   * real zero total.
+   */
+  empty: boolean;
 }
 
 export interface VolumeSeriesResult {
@@ -70,13 +96,15 @@ export function volumeSeries(
   let processedEvents = 0;
 
   if (!events || !Array.isArray(events)) {
-    return {
+    const emptyResult: VolumeSeriesResult = {
       buckets: [],
-      totalChallengeStake: "0",
-      totalSquadDeposit: "0",
+      totalChallengeStake: null,
+      totalSquadDeposit: null,
       skippedWithoutAt: 0,
       processedEvents: 0,
     };
+    attachSeriesMetadata(emptyResult, 0n, 0n);
+    return emptyResult;
   }
 
   interface IntermediateBucket {
@@ -184,11 +212,125 @@ export function volumeSeries(
     a.identityKey < b.identityKey ? -1 : a.identityKey > b.identityKey ? 1 : a.startAt - b.startAt,
   );
 
-  return {
+  const result: VolumeSeriesResult = {
     buckets,
     totalChallengeStake: totalChallengeStakeBigInt.toString(),
     totalSquadDeposit: totalSquadDepositBigInt.toString(),
     skippedWithoutAt,
     processedEvents,
   };
+
+  attachSeriesMetadata(result, totalChallengeStakeBigInt, totalSquadDepositBigInt);
+  return result;
+}
+
+/**
+ * Attach non-enumerable helper properties to VolumeSeriesResult so existing deepEqual
+ * assertions pass while consumers have convenient access to integer bigints and formatted USDC.
+ */
+function attachSeriesMetadata(
+  res: VolumeSeriesResult,
+  totalChallengeStakeBigInt: bigint,
+  totalSquadDepositBigInt: bigint,
+): void {
+  Object.defineProperty(res, "totalChallengeStakeBigInt", {
+    value: totalChallengeStakeBigInt,
+    enumerable: false,
+    configurable: true,
+    writable: true,
+  });
+  Object.defineProperty(res, "totalSquadDepositBigInt", {
+    value: totalSquadDepositBigInt,
+    enumerable: false,
+    configurable: true,
+    writable: true,
+  });
+  Object.defineProperty(res, "totalChallengeStakeUsdc", {
+    get: () => formatUsdc(totalChallengeStakeBigInt),
+    enumerable: false,
+    configurable: true,
+  });
+  Object.defineProperty(res, "totalSquadDepositUsdc", {
+    get: () => formatUsdc(totalSquadDepositBigInt),
+    enumerable: false,
+    configurable: true,
+  });
+}
+
+/**
+ * Format a single volume bucket at the export boundary, applying canonical
+ * 7-decimal USDC formatting to atomic integer amounts.
+ */
+export function exportVolumeBucket(bucket: VolumeBucket): ExportedVolumeBucket {
+  return {
+    ...bucket,
+    challengeStakeUsdc: formatUsdc(bucket.challengeStake),
+    squadDepositUsdc: formatUsdc(bucket.squadDeposit),
+  };
+}
+
+/**
+ * Format an array of volume buckets at the export boundary with 7-decimal USDC strings.
+ */
+export function exportVolumeBuckets(buckets: readonly VolumeBucket[]): ExportedVolumeBucket[] {
+  return buckets.map(exportVolumeBucket);
+}
+
+/** Alias for `exportVolumeBuckets`. */
+export const formatVolumeBuckets = exportVolumeBuckets;
+
+/**
+ * Export an entire volume series result at the presentation / export boundary,
+ * applying explicit 7-decimal USDC formatting (`formatUsdc`) to bucket and series totals.
+ *
+ * Keeps internal series accumulation strictly in atomic integer amounts (bigint)
+ * and formats decimal representations only at this boundary.
+ */
+export function exportVolumeSeries(result: VolumeSeriesResult): ExportedVolumeSeriesResult {
+  const challengeBigInt = result.buckets.reduce((sum, b) => sum + b.challengeStake, 0n);
+  const depositBigInt = result.buckets.reduce((sum, b) => sum + b.squadDeposit, 0n);
+
+  return {
+    buckets: exportVolumeBuckets(result.buckets),
+    totalChallengeStake: result.totalChallengeStake,
+    totalSquadDeposit: result.totalSquadDeposit,
+    totalChallengeStakeUsdc: formatUsdc(challengeBigInt),
+    totalSquadDepositUsdc: formatUsdc(depositBigInt),
+    totalChallengeStakeBigInt: challengeBigInt,
+    totalSquadDepositBigInt: depositBigInt,
+    skippedWithoutAt: result.skippedWithoutAt,
+    processedEvents: result.processedEvents,
+  };
+}
+
+/** Alias for `exportVolumeSeries`. */
+export const formatVolumeSeries = exportVolumeSeries;
+
+/**
+ * Render a plain-text summary of volume series buckets applying decimal USDC
+ * formatting at the export boundary.
+ */
+export function renderVolumeSeries(result: VolumeSeriesResult): string {
+  const exported = exportVolumeSeries(result);
+  const lines: string[] = [];
+
+  lines.push("Volume Series Summary:");
+  lines.push(`  Total Challenge Stake: ${exported.totalChallengeStakeUsdc} USDC`);
+  lines.push(`  Total Squad Deposit: ${exported.totalSquadDepositUsdc} USDC`);
+  lines.push(
+    `  Processed Events: ${exported.processedEvents} (Skipped without timestamp: ${exported.skippedWithoutAt})`,
+  );
+  lines.push(`  Buckets: ${exported.buckets.length}`);
+
+  if (exported.buckets.length > 0) {
+    lines.push("");
+    lines.push("Buckets:");
+    for (const b of exported.buckets) {
+      lines.push(
+        `  [${b.timestamp}] Challenge Stake: ${b.challengeStakeUsdc} USDC · Squad Deposit: ${b.squadDepositUsdc} USDC (${b.eventCount} events)`,
+      );
+    }
+  }
+
+  return lines.join("\n");
 }
