@@ -1,8 +1,27 @@
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { DEFAULT_DEDUP_WINDOW, EventDedupWindow, eventKey, type DedupableEvent } from "../dedup.js";
 import type { DecodedEvent } from "./decode.js";
+import {
+  computeCaptureCompleteness,
+  type CaptureCompleteness,
+  type CaptureCompletenessOptions,
+} from "./capture-completeness.js";
+
+export {
+  assertCompleteCapture,
+  computeCaptureCompleteness,
+  IncompleteCaptureError,
+  type CaptureCompleteness,
+  type CaptureCompletenessOptions,
+  type CaptureGap,
+  type CaptureGapInput,
+  type LedgerRange,
+} from "./capture-completeness.js";
 
 export type VolumeBucketUnit = "hour" | "day";
 
-export interface VolumeSeriesOptions {
+export interface VolumeSeriesOptions extends CaptureCompletenessOptions {
   bucket: VolumeBucketUnit;
   /**
    * Builds a per-event identity component from a `DecodedEvent`. When omitted,
@@ -36,6 +55,19 @@ export interface VolumeSeriesResult {
   totalSquadDeposit: string;
   skippedWithoutAt: number;
   processedEvents: number;
+  /** Capture completeness metadata including ledger range and gap information. */
+  completeness: CaptureCompleteness;
+  /** Alias for completeness metadata. */
+  capture: CaptureCompleteness;
+  /**
+   * Verified global market totals across the entire market lifetime.
+   * Only populated when `completeness.isComplete` is true.
+   * `null` for partial captures to prevent partial captures from being presented as global market totals.
+   */
+  globalMarketTotals: {
+    totalChallengeStake: string;
+    totalSquadDeposit: string;
+  } | null;
 }
 
 const SECONDS_PER_HOUR = 3600;
@@ -63,20 +95,68 @@ export function volumeSeries(
     throw new Error(`Invalid bucket unit: expected "hour" or "day", got ${String(bucketUnit)}`);
   }
 
+  // Derive capture completeness metadata (and enforce requireComplete if requested)
+  const completeness = computeCaptureCompleteness(events, options);
+
   const stepSeconds = bucketUnit === "hour" ? SECONDS_PER_HOUR : SECONDS_PER_DAY;
   const identityOf = options.identity ?? defaultIdentity;
 
-  let skippedWithoutAt = 0;
-  let processedEvents = 0;
+    this.minBucketStart = cp.minBucketStart;
+    this.maxBucketStart = cp.maxBucketStart;
+    try {
+      this.totalChallengeStakeBigInt = BigInt(cp.totalChallengeStake);
+    } catch {
+      this.totalChallengeStakeBigInt = 0n;
+    }
+    try {
+      this.totalSquadDepositBigInt = BigInt(cp.totalSquadDeposit);
+    } catch {
+      this.totalSquadDepositBigInt = 0n;
+    }
+    this.skippedWithoutAt = cp.skippedWithoutAt;
+    this.processedEvents = cp.processedEvents;
+    this.lastProcessedEventId = cp.lastProcessedEventId ?? null;
 
-  if (!events || !Array.isArray(events)) {
+    for (const b of cp.buckets) {
+      try {
+        this.bucketMap.set(b.startAt, {
+          startAt: b.startAt,
+          challengeStake: BigInt(b.challengeStake),
+          squadDeposit: BigInt(b.squadDeposit),
+          challengeCount: b.challengeCount,
+          depositCount: b.depositCount,
+          eventCount: b.eventCount,
+        });
+      } catch {
+        // Skip malformed individual bucket if bigint parse fails
+      }
+    }
+
+    if (Array.isArray(cp.recentEventIds)) {
+      for (const id of cp.recentEventIds) {
+        if (typeof id === "string" && id !== "") {
+          this.dedup.add(id);
+          this.checkpointDedup.add(id);
+        }
+      }
+    }
+  }
+
+  get stats(): { processedEvents: number; skippedWithoutAt: number; resumedDuplicates: number } {
     return {
       buckets: [],
       totalChallengeStake: "0",
       totalSquadDeposit: "0",
       skippedWithoutAt: 0,
       processedEvents: 0,
+      completeness,
+      capture: completeness,
+      globalMarketTotals: completeness.isComplete
+        ? { totalChallengeStake: "0", totalSquadDeposit: "0" }
+        : null,
     };
+    attachSeriesMetadata(emptyResult, 0n, 0n);
+    return emptyResult;
   }
 
   interface IntermediateBucket {
@@ -100,8 +180,12 @@ export function volumeSeries(
 
     const at = (event as { at?: unknown }).at;
     if (typeof at !== "number" || !Number.isFinite(at) || at < 0) {
-      skippedWithoutAt++;
-      continue;
+      this.skippedWithoutAt++;
+      if (key !== null) {
+        this.dedup.add(key);
+        this.lastProcessedEventId = key;
+      }
+      return false;
     }
 
     const payload = (event as { payload?: unknown }).payload;
@@ -141,8 +225,7 @@ export function volumeSeries(
     const prevMax = maxByKey.get(identityKey);
     if (prevMax === undefined || bucketStart > prevMax) maxByKey.set(identityKey, bucketStart);
 
-    totalChallengeStakeBigInt += challengeStakeDelta;
-    totalSquadDepositBigInt += squadDepositDelta;
+    const bucketStart = floorToBucketUtc(Math.floor(at), this.bucketUnit);
 
     let existing = bucketMap.get(compositeKey);
     if (!existing) {
@@ -159,6 +242,19 @@ export function volumeSeries(
     if (isChallenge) existing.challengeCount++;
     if (isDeposit) existing.depositCount++;
     existing.eventCount++;
+
+    if (this.maxBuckets !== undefined && this.bucketMap.size > this.maxBuckets) {
+      const sortedKeys = Array.from(this.bucketMap.keys()).sort((a, b) => a - b);
+      const toEvict = sortedKeys.slice(0, this.bucketMap.size - this.maxBuckets);
+      for (const k of toEvict) {
+        this.bucketMap.delete(k);
+      }
+      if (sortedKeys.length > toEvict.length) {
+        this.minBucketStart = sortedKeys[toEvict.length]!;
+      }
+    }
+
+    return true;
   }
 
   const buckets: VolumeBucket[] = [];
@@ -186,9 +282,17 @@ export function volumeSeries(
 
   return {
     buckets,
-    totalChallengeStake: totalChallengeStakeBigInt.toString(),
-    totalSquadDeposit: totalSquadDepositBigInt.toString(),
+    totalChallengeStake: totalChallengeStakeStr,
+    totalSquadDeposit: totalSquadDepositStr,
     skippedWithoutAt,
     processedEvents,
+    completeness,
+    capture: completeness,
+    globalMarketTotals: completeness.isComplete
+      ? {
+          totalChallengeStake: totalChallengeStakeStr,
+          totalSquadDeposit: totalSquadDepositStr,
+        }
+      : null,
   };
 }

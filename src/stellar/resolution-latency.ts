@@ -1,4 +1,27 @@
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { DEFAULT_DEDUP_WINDOW, EventDedupWindow, eventKey, type DedupableEvent } from "../dedup.js";
 import type { DecodedEvent } from "./decode.js";
+import {
+  computeCaptureCompleteness,
+  type CaptureCompleteness,
+  type CaptureCompletenessOptions,
+} from "./capture-completeness.js";
+
+export {
+  assertCompleteCapture,
+  computeCaptureCompleteness,
+  IncompleteCaptureError,
+  type CaptureCompleteness,
+  type CaptureCompletenessOptions,
+  type CaptureGap,
+  type CaptureGapInput,
+  type LedgerRange,
+} from "./capture-completeness.js";
+
+export const RESOLUTION_LATENCY_CHECKPOINT_FORMAT = "mimir-resolution-latency-checkpoint-v1";
+export const RESOLUTION_LATENCY_CHECKPOINT_VERSION = 1;
+export const DEFAULT_MAX_PENDING_CLAIMS = 10000;
 
 export interface LatencyDuration { seconds: number; ledgers: number; }
 export interface ClaimLatency {
@@ -22,10 +45,50 @@ export interface ResolutionLatencyOptions {
   identity?: (event: DecodedEvent) => string;
 }
 
+/**
+ * Versioned, bounded checkpoint state for claim resolution latency reducers.
+ *
+ * Persists pending creations, resolutions, and cancellations along with a bounded
+ * deduplication window of recent event identifiers to prevent double-counting
+ * when resuming across overlapping pagination boundaries.
+ */
+export interface ResolutionLatencyCheckpoint {
+  format: "mimir-resolution-latency-checkpoint-v1";
+  version: 1;
+  updatedAt: string;
+  processedEvents: number;
+  creations: [number, ClaimEventState][];
+  resolutions: [number, ClaimEventState][];
+  cancellations: [number, ClaimEventState][];
+  recentEventIds: string[];
+  lastProcessedEventId?: string | null;
+  dedupCapacity: number;
+  maxPendingClaims: number;
+}
+
+export interface ResolutionLatencyOptions {
+  /** Optional versioned checkpoint from a previous scan to resume from. */
+  checkpoint?: ResolutionLatencyCheckpoint | null;
+  /** Deduplication window capacity for dropping overlapping events across scan pages (default: 256). */
+  dedupCapacity?: number;
+  /** Whether to drop duplicate event IDs within and across batches. Defaults to true when resuming from a checkpoint. */
+  dedup?: boolean;
+  /** Maximum number of pending/unresolved claims to track in memory (default: 10000). */
+  maxPendingClaims?: number;
+  /** Whether to attach checkpoint state to the returned report. */
+  includeCheckpoint?: boolean;
+}
+
+export interface ResolutionLatencyOptions extends CaptureCompletenessOptions {}
+
 export interface ResolutionLatencyReport {
   resolved: LatencyGroup;
   cancelled: LatencyGroup;
   excludedCount: number;
+  /** Capture completeness metadata including ledger range and gap information. */
+  completeness: CaptureCompleteness;
+  /** Alias for completeness metadata. */
+  capture: CaptureCompleteness;
 }
 
 function nearestRank(sortedValues: number[], p: number): number {
@@ -64,6 +127,7 @@ export function resolutionLatency(
   const cancellations = new Map<string, EndPoint & { claimId: number }>();
 
   for (const event of events) {
+    if (!event || typeof event !== "object") continue;
     const payload = event.payload;
     if (!payload || !("name" in payload) || !("claimId" in payload)) continue;
     const claimId = payload.claimId;
@@ -134,5 +198,7 @@ export function resolutionLatency(
     resolved: { claims: resolvedClaims, summary: computeSummary(resolvedClaims) },
     cancelled: { claims: cancelledClaims, summary: computeSummary(cancelledClaims) },
     excludedCount,
+    completeness,
+    capture: completeness,
   };
 }
